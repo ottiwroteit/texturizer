@@ -7,6 +7,7 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +20,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from mmgp import offload
 from PIL import Image, ImageOps
-from pygltflib import Accessor, BufferView, GLTF2, PbrMetallicRoughness
+from pygltflib import Accessor, BufferView, GLTF2, Material, PbrMetallicRoughness, Texture, TextureInfo
+from pygltflib import Image as GLTFImage
 
 from hy3dgen.rembg import BackgroundRemover
 from hy3dgen.shapegen import (
@@ -56,12 +58,15 @@ AI_TEXTURE_LABEL = (
     "Keeps the uploaded geometry and rig, then generates a new material or texture from the image."
 )
 IMAGE_TEXTURE_LABEL = (
-    "Apply exact UV map\n"
-    "Applies the uploaded image directly as the UV texture. Use only when the image is already a UV map for that mesh."
+    "Mac CPU texture\n"
+    "Embeds the uploaded image as the GLB texture while preserving the original mesh and rig. Works without CUDA."
 )
 TEXTURE_MODE_CHOICES = [
     (CHARACTER_TEXTURE_LABEL, CHARACTER_TEXTURE_MODE),
     (AI_TEXTURE_LABEL, AI_TEXTURE_MODE),
+    (IMAGE_TEXTURE_LABEL, IMAGE_TEXTURE_MODE),
+]
+CPU_TEXTURE_MODE_CHOICES = [
     (IMAGE_TEXTURE_LABEL, IMAGE_TEXTURE_MODE),
 ]
 APP_CSS = """
@@ -361,10 +366,26 @@ def normalize_glb_character_materials(path: Path) -> Path:
     return path
 
 
+def cuda_features_available() -> bool:
+    return torch.cuda.is_available()
+
+
+def available_texture_mode_choices():
+    if cuda_features_available():
+        return TEXTURE_MODE_CHOICES
+    return CPU_TEXTURE_MODE_CHOICES
+
+
+def default_texture_mode() -> str:
+    if cuda_features_available():
+        return CHARACTER_TEXTURE_MODE
+    return IMAGE_TEXTURE_MODE
+
+
 def normalize_texture_mode(texture_mode: Optional[str], image_path: Optional[Path]) -> str:
     value = (texture_mode or "auto").strip().lower()
     if value in {"auto", ""}:
-        return "character"
+        return default_texture_mode()
     if value in {
         "character",
         "shape",
@@ -386,6 +407,9 @@ def normalize_texture_mode(texture_mode: Optional[str], image_path: Optional[Pat
         "use image as texture map",
         "use image as exact uv texture map",
         "apply exact uv map",
+        "mac cpu texture",
+        "cpu",
+        "cpu texture",
         IMAGE_TEXTURE_MODE.lower(),
     }:
         return "image"
@@ -426,6 +450,123 @@ def apply_image_as_existing_uv_texture(mesh, image_path: Path, output_path: Path
     )
     textured_mesh.export(str(output_path))
     normalize_glb_character_materials(output_path)
+    return output_path
+
+
+def planar_uv_from_positions(positions: np.ndarray) -> np.ndarray:
+    if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] == 0:
+        raise RuntimeError("Cannot generate CPU UVs without POSITION vertex data.")
+    extents = np.ptp(positions, axis=0)
+    axes = np.argsort(extents)[-2:]
+    uv = positions[:, axes].astype(np.float32)
+    minimum = uv.min(axis=0)
+    span = uv.max(axis=0) - minimum
+    span[span < 1e-8] = 1.0
+    uv = (uv - minimum) / span
+    uv[:, 1] = 1.0 - uv[:, 1]
+    return uv.astype(np.float32)
+
+
+def append_cpu_texture_material(gltf: GLTF2, blob: bytearray, image_path: Path) -> int:
+    for attr in ("bufferViews", "images", "textures", "materials"):
+        if getattr(gltf, attr) is None:
+            setattr(gltf, attr, [])
+
+    png_buffer = BytesIO()
+    open_rgba_image(image_path).save(png_buffer, format="PNG")
+    png_bytes = png_buffer.getvalue()
+    image_offset = append_bytes(blob, png_bytes)
+    image_buffer_view = BufferView(
+        buffer=0,
+        byteOffset=image_offset,
+        byteLength=len(png_bytes),
+    )
+    image_buffer_view_index = len(gltf.bufferViews)
+    gltf.bufferViews.append(image_buffer_view)
+
+    image_index = len(gltf.images)
+    gltf.images.append(GLTFImage(bufferView=image_buffer_view_index, mimeType="image/png"))
+
+    texture_index = len(gltf.textures)
+    gltf.textures.append(Texture(source=image_index))
+
+    material_index = len(gltf.materials)
+    gltf.materials.append(
+        Material(
+            name="Texturizer CPU Image Material",
+            pbrMetallicRoughness=PbrMetallicRoughness(
+                baseColorTexture=TextureInfo(index=texture_index),
+                baseColorFactor=CHARACTER_BASE_COLOR_FACTOR.copy(),
+                metallicFactor=CHARACTER_METALLIC_FACTOR,
+                roughnessFactor=CHARACTER_ROUGHNESS_FACTOR,
+            ),
+        )
+    )
+    return material_index
+
+
+def append_cpu_uv_accessor(gltf: GLTF2, blob: bytearray, uv: np.ndarray) -> int:
+    if gltf.bufferViews is None:
+        gltf.bufferViews = []
+    if gltf.accessors is None:
+        gltf.accessors = []
+
+    uv = np.ascontiguousarray(uv, dtype=np.float32)
+    chunk = uv.tobytes()
+    byte_offset = append_bytes(blob, chunk)
+    buffer_view = BufferView(
+        buffer=0,
+        byteOffset=byte_offset,
+        byteLength=len(chunk),
+        target=ARRAY_BUFFER,
+    )
+    buffer_view_index = len(gltf.bufferViews)
+    gltf.bufferViews.append(buffer_view)
+    accessor_index = len(gltf.accessors)
+    gltf.accessors.append(
+        Accessor(
+            bufferView=buffer_view_index,
+            byteOffset=0,
+            componentType=5126,
+            count=uv.shape[0],
+            type="VEC2",
+            min=uv.min(axis=0).astype(float).tolist(),
+            max=uv.max(axis=0).astype(float).tolist(),
+        )
+    )
+    return accessor_index
+
+
+def apply_cpu_image_texture_to_glb(source_path: Path, image_path: Path, output_path: Path) -> Path:
+    gltf = GLTF2().load_binary(str(source_path))
+    if not gltf.meshes:
+        raise RuntimeError("CPU texture mode requires a GLB with at least one mesh.")
+
+    blob = bytearray(gltf.binary_blob() or b"")
+    material_index = append_cpu_texture_material(gltf, blob, image_path)
+
+    for mesh in gltf.meshes or []:
+        for primitive in mesh.primitives or []:
+            primitive.material = material_index
+            if getattr(primitive.attributes, "TEXCOORD_0", None) is None:
+                position_accessor = getattr(primitive.attributes, "POSITION", None)
+                if position_accessor is None:
+                    raise RuntimeError("Cannot generate CPU UVs for a primitive without POSITION data.")
+                positions = read_accessor_array(gltf, position_accessor).astype(np.float32)
+                primitive.attributes.TEXCOORD_0 = append_cpu_uv_accessor(
+                    gltf,
+                    blob,
+                    planar_uv_from_positions(positions),
+                )
+
+    final_length = align4(len(blob))
+    if final_length > len(blob):
+        blob.extend(b"\x00" * (final_length - len(blob)))
+    if gltf.buffers:
+        gltf.buffers[0].byteLength = len(blob)
+    gltf.set_binary_blob(bytes(blob))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    gltf.save_binary(str(output_path))
     return output_path
 
 
@@ -1267,6 +1408,8 @@ class TextureService:
         mesh = self.load_mesh_for_texturing(geometry_input)
 
         if mode == "character":
+            if not cuda_features_available():
+                raise RuntimeError("New character mode requires an NVIDIA CUDA GPU. On this Mac, use Mac CPU texture mode.")
             conditioning_path = self.build_conditioning_image(image_path, job_dir)
             preview_path = self.generate_textured_character_mesh(conditioning_path, input_copy, job_dir, max_faces)
 
@@ -1291,25 +1434,33 @@ class TextureService:
             if image_path is None:
                 raise RuntimeError("Image texture mode requires an uploaded image.")
 
-            log_step("applying uploaded image as exact UV texture")
             texture_source_path = job_dir / "texture_source.png"
             open_rgba_image(image_path).save(texture_source_path)
+
+            if input_copy.suffix.lower() == ".glb":
+                final_path = job_dir / "textured_rigged.glb"
+                log_step("applying uploaded image with CPU GLB texture path")
+                apply_cpu_image_texture_to_glb(input_copy, texture_source_path, final_path)
+                log_step(f"CPU textured GLB exported: {final_path.name}")
+                if rigged_glb and preserve_rig:
+                    status = "Applied the uploaded image locally on CPU and preserved the original GLB rig."
+                else:
+                    status = "Applied the uploaded image locally on CPU to the original GLB."
+                return TextureResult(final_path, texture_source_path, status, final_path)
+
+            log_step("applying uploaded image as exact UV texture")
             preview_path = job_dir / "textured_preview.glb"
             apply_image_as_existing_uv_texture(mesh, texture_source_path, preview_path)
             log_step(f"preview GLB exported: {preview_path.name}")
-
-            if rigged_glb and preserve_rig:
-                final_path = job_dir / "textured_rigged.glb"
-                merge_texture_into_rigged_glb(input_copy, preview_path, final_path, copy_uv=False)
-                log_step(f"rigged final GLB exported: {final_path.name}")
-                status = "Applied uploaded image as the existing UV texture map. Rig preserved in the original GLB."
-                return TextureResult(final_path, texture_source_path, status, preview_path)
 
             if rigged_glb and not preserve_rig:
                 status = "Applied uploaded image as the existing UV texture map. Returned geometry-only output without rig preservation."
             else:
                 status = "Applied uploaded image as the existing UV texture map."
             return TextureResult(preview_path, texture_source_path, status, preview_path)
+
+        if not cuda_features_available():
+            raise RuntimeError("AI retexture mode requires an NVIDIA CUDA GPU. On this Mac, use Mac CPU texture mode.")
 
         conditioning_path = self.build_conditioning_image(image_path, job_dir)
         paint = self.ensure_paint()
@@ -1426,6 +1577,13 @@ def build_ui():
             Upload a source mesh or start from a bundled example, then add a reference image.
             """
         )
+        if not cuda_features_available():
+            gr.Markdown(
+                """
+                **Mac CPU mode is active.** CUDA-only Hunyuan generation is hidden on this machine.
+                The available mode embeds your uploaded image into the GLB and preserves the rig locally.
+                """
+            )
         with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=420):
                 selected_mesh_state = gr.State(None)
@@ -1455,8 +1613,8 @@ def build_ui():
                             bundled_quadruped_button = gr.Button("Use Dog quadruped", size="sm")
                 image_input = gr.Image(label="Reference image", type="filepath")
                 texture_mode_input = gr.Radio(
-                    choices=TEXTURE_MODE_CHOICES,
-                    value=CHARACTER_TEXTURE_MODE,
+                    choices=available_texture_mode_choices(),
+                    value=default_texture_mode(),
                     label="Texture mode",
                     elem_classes=["texture-mode-radio"],
                 )
